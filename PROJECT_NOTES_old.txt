@@ -1,0 +1,517 @@
+================================================================================
+PROJECT NOTES — Water Body Detection, Quality Monitoring & Dashboard
+================================================================================
+Author      : Akash
+Date Started: April 2026
+Working Dir : D:\rfWater
+================================================================================
+
+
+────────────────────────────────────────────────────────────────────────────────
+1. PROJECT GOAL
+────────────────────────────────────────────────────────────────────────────────
+
+Build a complete pipeline to:
+  (a) Detect and map water bodies from satellite imagery using ML
+  (b) Monitor how water body area changes over time (temporal analysis)
+  (c) Monitor water quality changes over time
+  (d) Present results in an interactive web dashboard
+
+The final dashboard will allow users to:
+  - Select a geometry (area of interest) on a map
+  - Select a time frame (year range)
+  - See water body area increase/decrease over time
+  - See water quality changes over time (turbidity, chlorophyll, clarity)
+
+
+────────────────────────────────────────────────────────────────────────────────
+2. DATASET
+────────────────────────────────────────────────────────────────────────────────
+
+Source: Google Earth Engine (GEE) — Sentinel-1 and Sentinel-2
+Period: 2017–2025 (March to June composite per year)
+Location: IMPORTANT — each year's data is from a DIFFERENT geographic location
+           (9 different water bodies, not the same location over time)
+
+Image dimensions: 4,652 × 7,156 pixels per scene
+Spatial resolution: 10 metres per pixel
+
+Files per year (stored in D:\rfWater\DATA_DIR):
+  S2_March_June_{year}.tif        Sentinel-2, 5 bands
+  S1_ASC_March_June_{year}.tif    Sentinel-1 Ascending, VV polarisation
+  S1_DESC_March_June_{year}.tif   Sentinel-1 Descending, VV polarisation
+  WaterPoints_Clipped_March_June_{year}.shp   Ground truth water points
+
+Train years : 2017, 2018, 2019, 2020, 2021, 2022
+Test years  : 2023, 2024, 2025
+
+Sentinel-2 bands in original dataset:
+  Index 0 : B2  (Blue,  490nm)
+  Index 1 : B3  (Green, 560nm)
+  Index 2 : B4  (Red,   665nm)
+  Index 3 : B8  (NIR,   842nm)
+  Index 4 : B11 (SWIR,  1610nm)
+
+Sentinel-1 bands:
+  S1 VV Ascending
+  S1 VV Descending
+
+
+────────────────────────────────────────────────────────────────────────────────
+3. WHAT HAS BEEN BUILT (EXISTING CODE)
+────────────────────────────────────────────────────────────────────────────────
+
+3.1 ENSEMBLE ML MODEL  (water_classification_ensemble.py)
+──────────────────────────────────────────────────────────
+Class: WaterMaskEnsemble
+Approach: Point-based classification (not spatial/patch-based)
+
+X features (8 per pixel — MNDWI added during this project):
+  0: B2 (Blue)
+  1: B3 (Green)
+  2: B4 (Red)
+  3: B8 (NIR)
+  4: B11 (SWIR)
+  5: S1_VV_ASC
+  6: S1_VV_DESC
+  7: MNDWI = (B3 - B11) / (B3 + B11)
+
+Y label: 1 = water, 0 = non-water
+
+Training samples:
+  Water samples    : extracted from annual ground truth shapefiles (~50/year)
+  Non-water samples: pixels where MNDWI < threshold, buffered away from water
+
+Models combined (soft voting — probability averaging):
+  Random Forest : n_estimators=200, max_depth=20, class_weight='balanced'
+  SVM           : kernel='rbf', C=10, probability=True + StandardScaler
+  XGBoost       : max_depth=7, lr=0.1, n_estimators=200
+
+Outputs saved to: results_ensemble/
+  ensemble_models/rf_model.pkl
+  ensemble_models/svm_model.pkl
+  ensemble_models/scaler.pkl
+  ensemble_models/xgb_model.json
+  water_mask_ensemble_{year}.tif
+  confusion_matrix_ensemble.png
+  feature_importance_ensemble.png
+
+NOTE: MNDWI was added to X features during this project session for all four
+      model files (ensemble, rf, svm, xgboost).
+
+3.2 INDIVIDUAL MODEL FILES
+───────────────────────────
+  water_classification_rf.py      RandomForest only
+  water_classification_svm.py     SVM only
+  water_classification_xgboost.py XGBoost only
+
+All three were updated to include MNDWI as band index 7.
+
+3.3 U-NET MODEL  (water_classification_unet.py)
+────────────────────────────────────────────────
+Approach: Patch-based semantic segmentation
+
+Architecture: Standard U-Net
+  Input  : (7, 256, 256) — 7-band satellite patch (MNDWI excluded from X)
+  Output : (1, 256, 256) — water probability map (sigmoid applied at inference)
+  Encoder: 4 blocks (DoubleConv + MaxPool), features = [64, 128, 256, 512]
+  Decoder: 4 blocks (ConvTranspose + skip connections + DoubleConv)
+  Total parameters: 31,039,937
+
+X features: B2, B3, B4, B8, B11, S1_VV_ASC, S1_VV_DESC (7 bands)
+  NOTE: MNDWI is deliberately EXCLUDED from X to avoid label leakage
+        (Y is derived from MNDWI, so including MNDWI in X would be circular)
+
+Y labels: Binary water mask derived from MNDWI > 0.0 threshold
+  This is a self-supervised labelling strategy — no manual annotation needed.
+  Called "pseudo-labels" in remote sensing literature.
+
+Patch generation:
+  Patch size : 256 × 256 pixels
+  Stride     : 128 pixels (50% overlap)
+  Per image  : ~1,890 patches
+  Train total: 11,340 patches (2017–2022)
+  Test total : 5,670 patches (2023–2025)
+  Saved as   : GeoTIFF with proper georeference preserved per patch
+
+  Directory structure:
+    D:\rfWater\patches\
+      train\
+        images\  patch_{year}_r{row}_c{col}.tif   (float32, 7 bands)
+        masks\   mask_{year}_r{row}_c{col}.tif    (uint8, 1 band, binary)
+      test\
+        images\  ...
+        masks\   ...
+
+  IMPORTANT: Patches are generated ONCE and reused. The script checks if
+             patches already exist before regenerating. To force regeneration,
+             delete the patches/ folder.
+
+Pair matching: mask filename = image filename with 'patch_' replaced by 'mask_'
+  e.g. patch_2017_r0_c128.tif ↔ mask_2017_r0_c128.tif
+
+Loss function: DiceBCELoss (combined Dice + BCEWithLogitsLoss)
+  BCEWithLogitsLoss is used instead of BCELoss for numerical stability.
+  Model outputs raw logits; sigmoid is applied during evaluation and inference.
+
+Training config (current quick-test values — change for full run):
+  BATCH_SIZE        = 8
+  LEARNING_RATE     = 1e-4
+  NUM_EPOCHS        = 10
+  BATCHES_PER_EPOCH = 80    (set to None for full training)
+  BATCHES_PER_EVAL  = 40    (set to None for full evaluation)
+
+GPU setup:
+  Device: NVIDIA GeForce RTX 4050 Laptop GPU (6.4 GB VRAM)
+  CUDA  : 13.2 (driver), PyTorch CUDA 12.4 wheels used (backward compatible)
+  AMP   : Automatic Mixed Precision enabled via torch.amp.autocast('cuda')
+          and torch.amp.GradScaler('cuda')
+  cudnn.benchmark = True (auto-tunes kernels for fixed 256×256 input)
+
+Model saving: Best model saved as results_unet/unet_best.pth
+  Saved whenever test IoU improves during training.
+  Prediction step explicitly loads unet_best.pth (not last epoch weights).
+
+Full image prediction:
+  Processes scene in 256×256 patches with 128 stride.
+  Overlapping patch predictions are AVERAGED for smooth boundaries.
+  Outputs:
+    results_unet/probability_map_unet_{year}.tif
+    results_unet/water_mask_unet_{year}.tif
+
+3.4 EVALUATION SCRIPT  (evaluate_unet.py)
+──────────────────────────────────────────
+Compares U-Net predictions against MNDWI ground truth mask for test years.
+
+Metrics computed per year:
+  Accuracy, Precision, Recall, F1, IoU
+  Water coverage % (ground truth vs predicted)
+  Confusion matrix values (TP, FP, FN, TN)
+
+Outputs per year:
+  results_unet/evaluation_{year}.png
+    Panel 1: RGB composite (S2 B4/B3/B2 false colour)
+    Panel 2: MNDWI ground truth mask
+    Panel 3: U-Net probability map with colorbar
+    Panel 4: Difference map (TP=blue / FP=red / FN=orange / TN=dark)
+
+  results_unet/evaluation_summary.png
+    Grouped bar chart (IoU, F1, Precision, Recall) across all test years
+
+3.5 DEPENDENCY INSTALLER  (install_dependencies.py)
+────────────────────────────────────────────────────
+Installs all required packages using sys.executable (correct Python env).
+PyTorch installed with CUDA 12.4 wheels for RTX 4050 compatibility.
+
+
+────────────────────────────────────────────────────────────────────────────────
+4. KEY DISCUSSIONS AND DECISIONS
+────────────────────────────────────────────────────────────────────────────────
+
+4.1 WHY MNDWI WAS ADDED TO X FEATURES (Ensemble/RF/SVM/XGBoost)
+──────────────────────────────────────────────────────────────────
+MNDWI = (B3 - B11) / (B3 + B11)
+Previously only used internally to generate non-water training samples.
+Added as input feature (index 7) to all four classical ML models.
+NOT added to U-Net X features — see section 4.2.
+
+4.2 WHY MNDWI IS EXCLUDED FROM U-NET X FEATURES
+──────────────────────────────────────────────────
+U-Net Y labels are derived from MNDWI threshold (MNDWI > 0.0 = water).
+B3 and B11 (used to compute MNDWI) are already in X.
+Including the pre-computed MNDWI in X would create direct data leakage —
+the model could trivially solve the task by thresholding the MNDWI channel,
+learning nothing spatially useful.
+U-Net must learn water from raw spectral + radar signals.
+
+4.3 CAN U-NET BE USED WITH THIS DATASET? (discussed before building)
+──────────────────────────────────────────────────────────────────────
+Dataset limitations for U-Net:
+  - Ground truth is point-based (shapefiles), not pixel-level masks
+  - U-Net needs dense pixel-level labels
+
+Solution adopted: MNDWI-derived pseudo-labels
+  - Apply MNDWI threshold to get binary water mask for every pixel
+  - Use this as Y for U-Net training
+  - Valid self-supervised approach used in published remote sensing research
+  - U-Net adds value over raw MNDWI by learning spatial context, shapes,
+    and using S1 radar to correct MNDWI errors (e.g. cloud shadows)
+
+4.4 WHY PATCHES ARE SAVED AS TIF (not NPY)
+────────────────────────────────────────────
+TIF preserves georeference (transform + CRS) per patch.
+This means every patch knows exactly where it is on Earth.
+Enables: spatial queries, map overlays, proper geographic analysis.
+NPY would lose all geographic information.
+
+4.5 WHY PROBABILITY MAP AND WATER MASK LOOK IDENTICAL
+───────────────────────────────────────────────────────
+The model outputs values close to 0.0 or 1.0 (not gradients like 0.3–0.6).
+This is expected because:
+  - Training labels are hard binary (0 or 1 from MNDWI threshold)
+  - Water is spectrally very distinct from land — model is confident
+Thresholding at 0.5 barely changes the image.
+The probability map is useful at pixel boundaries (shorelines) where
+the model has intermediate confidence, visible only when zoomed in.
+
+4.6 S1 AND S2 SPATIAL ALIGNMENT IN PATCHES
+────────────────────────────────────────────
+S1 images have different native resolution and CRS than S2.
+In load_sentinel_data(), S1 is reprojected onto the S2 grid using
+rasterio.warp.reproject() before stacking.
+After stacking, all_bands shape is (7, H, W) — every pixel at every
+band index corresponds to the exact same ground location.
+Patches extracted at any (row, col) window are spatially consistent
+across all 7 bands.
+
+4.7 DATASET CRITICAL CLARIFICATION
+─────────────────────────────────────
+Each year's data is from a DIFFERENT geographic location.
+This means:
+  CANNOT DO:
+    - Temporal change of one water body over time
+    - Multi-temporal U-Net (stacking years is meaningless)
+    - Water frequency maps (pixel positions don't correspond across years)
+  CAN DO:
+    - General water detection model (diverse locations = better generalisation)
+    - Cross-location comparison of water body characteristics
+    - Per-location water quality analysis
+
+  TO DO TEMPORAL ANALYSIS:
+    Re-download data from GEE for the SAME location across all years.
+    See section 5 (New Data Download Plan).
+
+
+────────────────────────────────────────────────────────────────────────────────
+5. NEW DATA DOWNLOAD PLAN (GEE)
+────────────────────────────────────────────────────────────────────────────────
+
+Script: gee_download.js (paste into code.earthengine.google.com)
+
+Purpose: Download Sentinel-1 + Sentinel-2 for the SAME location across
+         2017–2025 to enable proper temporal analysis.
+
+Steps:
+  1. Open https://code.earthengine.google.com
+  2. Draw your area of interest using the polygon/rectangle tool
+     (GEE names it 'geometry' automatically)
+  3. Set CRS variable to your UTM zone (find at https://epsg.io)
+  4. Click Run — map preview appears for 2023
+  5. Go to Tasks tab → click RUN on each export task
+  6. Files saved to Google Drive folder 'rfWater_new'
+
+Bands downloaded (expanded from original 5):
+  Sentinel-2 (10 bands):
+    B2  (Blue)       — water clarity, CDOM
+    B3  (Green)      — MNDWI numerator, chlorophyll proxy
+    B4  (Red)        — NDTI turbidity, NDCI denominator
+    B5  (Red Edge 1) — NDCI numerator (chlorophyll-a) ← NEW
+    B6  (Red Edge 2) — phycocyanin / cyanobacteria    ← NEW
+    B7  (Red Edge 3) — chlorophyll supplement          ← NEW
+    B8  (NIR)        — NDWI, water/vegetation boundary
+    B8A (Narrow NIR) — refined water edge detection    ← NEW
+    B11 (SWIR-1)     — MNDWI denominator, turbidity
+    B12 (SWIR-2)     — additional turbidity index      ← NEW
+  Sentinel-1:
+    VV Ascending
+    VV Descending
+
+Water quality indices computable from new bands:
+  MNDWI      : (B3-B11)/(B3+B11)    — water extent
+  NDTI       : (B4-B3)/(B4+B3)      — turbidity
+  NDCI       : (B5-B4)/(B5+B4)      — chlorophyll-a concentration
+  Clarity    : B2/B4                 — water transparency
+  Algae index: B8-B4                 — floating algae / surface vegetation
+  Sediment   : B4 mean               — suspended sediment load
+  Phycocyanin: B6/B5                 — cyanobacteria (blue-green algae)
+
+NOTE: After downloading new data, update load_sentinel_data() in Python
+      scripts to reflect the new band count (10 instead of 5 for S2).
+      Band indices will shift accordingly.
+
+
+────────────────────────────────────────────────────────────────────────────────
+6. TIME SERIES PLAN
+────────────────────────────────────────────────────────────────────────────────
+
+PREREQUISITE: New data from GEE (same location, all years) — see section 5.
+
+6.1 WATER BODY AREA CHANGE
+───────────────────────────
+  - Run U-Net prediction on all 9 years (same location)
+  - Count water pixels per year → multiply by pixel area (10m × 10m = 100m²)
+  - Convert to km²
+  - Plot annual water area as time series
+  - Compute year-over-year % change
+
+6.2 CHANGE DETECTION MAP (per year pair)
+──────────────────────────────────────────
+  Compare water mask of year N vs year N-1:
+    Pixel value 1 in both  → Stable water (blue)
+    Pixel value 0→1        → Water gain (green)
+    Pixel value 1→0        → Water loss (red)
+    Pixel value 0 in both  → Stable non-water (dark)
+
+6.3 WATER QUALITY TIME SERIES
+───────────────────────────────
+  For each year, compute indices ONLY within water pixels (mask applied first).
+  Then take spatial mean → one value per year per index.
+  Plot as multi-line time series chart.
+
+6.4 MULTI-TEMPORAL U-NET (future improvement)
+───────────────────────────────────────────────
+  Stack T consecutive years as input: shape (T×7, 256, 256)
+  For T=3: channels 0–6 = year N-2, channels 7–13 = year N-1,
+           channels 14–20 = year N
+  U-Net architecture unchanged — only in_channels changes from 7 to T×7.
+  Model learns temporal patterns (seasonal wetlands, permanent lakes, etc.)
+  Requires: same location data across years (new GEE download).
+
+
+────────────────────────────────────────────────────────────────────────────────
+7. DASHBOARD PLAN
+────────────────────────────────────────────────────────────────────────────────
+
+7.1 ARCHITECTURE DECISION
+───────────────────────────
+WRONG approach (too slow for free hosting):
+  User draws geometry → GEE fetches data → U-Net runs → results shown
+  Problem: 15–25 minutes per request, free servers time out in 10–30 seconds.
+
+CORRECT approach (precompute offline, serve online):
+  OFFLINE (your machine, run once):
+    GEE API → download imagery → U-Net → water masks + quality indices
+    → save as GeoTIFF + summary CSV
+  ONLINE (the website):
+    Reads precomputed files, clips to user geometry, serves charts
+    No ML at runtime, no GEE calls at runtime → fast (milliseconds)
+
+7.2 TECHNOLOGY STACK
+──────────────────────
+  Data processing : Python + rasterio + numpy (already in pipeline)
+  Backend API     : FastAPI (lightweight, async, JSON-native)
+  Dashboard       : Plotly Dash + dash-leaflet (Python-native, map drawing)
+  Charts          : Plotly (interactive time series, hover tooltips)
+  Raster serving  : Cloud Optimised GeoTIFF (COG) or PNG tiles
+  Storage         : Local GeoTIFFs + CSV (or Cloudflare R2 / Backblaze B2
+                    for free cloud object storage)
+
+7.3 HOSTING
+────────────
+  Vercel  : NOT suitable (50MB package limit, 10s timeout, no PyTorch)
+  Netlify : NOT suitable (same reasons as Vercel)
+
+  RECOMMENDED: Hugging Face Spaces (free)
+    - Built for ML-backed data science apps
+    - Supports Python, Gradio, Streamlit
+    - No timeout issues for data science workloads
+    - Free GPU available for demos
+
+  ALTERNATIVE: Streamlit Cloud (free)
+    - Best if using Streamlit as frontend
+    - Python-native, easy deployment from GitHub
+
+7.4 DASHBOARD LAYOUT
+──────────────────────
+  ┌─────────────────────────────────────────────────────────┐
+  │  NAVBAR: Water Body Monitor                             │
+  ├──────────────────────┬──────────────────────────────────┤
+  │  Interactive Map     │  Controls                        │
+  │  (draw geometry)     │    Year range slider             │
+  │                      │                                  │
+  │  Overlays:           │  Water Area Over Time            │
+  │  □ Water mask        │    [line chart — km² per year]   │
+  │  □ Quality index     │                                  │
+  │  □ Change map        │  Water Quality Over Time         │
+  │                      │    [NDTI / NDCI / Clarity]       │
+  │                      │                                  │
+  │                      │  Summary Stats                   │
+  │                      │    Area:    ▲ +12% vs last year  │
+  │                      │    Turbid:  ▼ -5% vs last year   │
+  └──────────────────────┴──────────────────────────────────┘
+
+7.5 BACKEND API ENDPOINTS
+───────────────────────────
+  POST /water-area      → time series of water area (km²) within geometry
+  POST /water-quality   → time series of NDTI, NDCI, clarity per year
+  POST /change-map      → pixel-level gain/loss map between two selected years
+  GET  /years           → list of available years
+
+7.6 LIMITATION
+───────────────
+  Users can draw sub-geometries WITHIN the precomputed area.
+  They cannot request a completely different region of the world.
+  For arbitrary global queries: use GEE's JRC Global Surface Water dataset
+  (GEE handles computation, no model needed, works for any geometry).
+  U-Net results can be shown as a comparison layer for the studied region.
+
+
+────────────────────────────────────────────────────────────────────────────────
+8. BUILD ORDER (RECOMMENDED SEQUENCE)
+────────────────────────────────────────────────────────────────────────────────
+
+  Step 1  : Download new data from GEE (same location, 2017–2025, 10 S2 bands)
+  Step 2  : Update load_sentinel_data() for 10-band S2 structure
+  Step 3  : Retrain U-Net on new data (same location enables temporal analysis)
+  Step 4  : Generate water masks for all 9 years using trained U-Net
+  Step 5  : Compute water quality indices for all years, save GeoTIFFs + CSV
+  Step 6  : Build FastAPI backend (clip to geometry, return statistics)
+  Step 7  : Build Dash frontend (map, charts, controls)
+  Step 8  : Deploy to Hugging Face Spaces
+
+  Full training (when ready — remove batch limits):
+    Set BATCHES_PER_EPOCH = None
+    Set BATCHES_PER_EVAL  = None
+    Set NUM_EPOCHS        = 50
+
+
+────────────────────────────────────────────────────────────────────────────────
+9. FILES IN THIS PROJECT
+────────────────────────────────────────────────────────────────────────────────
+
+  water_classification_ensemble.py  Ensemble model (RF + SVM + XGBoost)
+  water_classification_rf.py        Random Forest only
+  water_classification_svm.py       SVM only
+  water_classification_xgboost.py   XGBoost only
+  water_classification_unet.py      U-Net (main model going forward)
+  evaluate_unet.py                  Evaluation + visualisation script
+  predict_new_ensemble.py           Inference with saved ensemble models
+  install_dependencies.py           Package installer (detects CUDA)
+  gee_download.js                   GEE script for new data download
+  CLAUDE.md                         Codebase notes for Claude Code
+  PROJECT_NOTES.txt                 This file
+
+  DATA_DIR/                         Original satellite imagery (9 years)
+  patches/                          Generated U-Net patches (TIF format)
+    train/images/ + train/masks/
+    test/images/  + test/masks/
+  results_ensemble/                 Ensemble model outputs
+  results_unet/                     U-Net outputs + evaluation plots
+    unet_best.pth                   Best model weights (saved by IoU)
+    training_curves.png
+    probability_map_unet_{year}.tif
+    water_mask_unet_{year}.tif
+    evaluation_{year}.png
+    evaluation_summary.png
+
+
+────────────────────────────────────────────────────────────────────────────────
+10. ENVIRONMENT
+────────────────────────────────────────────────────────────────────────────────
+
+  Python    : Anaconda base environment
+  Run with  : python (not py — py uses wrong system Python)
+  GPU       : NVIDIA GeForce RTX 4050 Laptop GPU, 6.4 GB VRAM
+  CUDA      : 13.2 (driver), cu124 (PyTorch wheels)
+  PyTorch   : 2.6.0+cu124
+  OS        : Windows 11
+
+  Key packages:
+    torch==2.6.0+cu124
+    rasterio, geopandas, shapely
+    scikit-learn, xgboost
+    numpy, pandas, matplotlib, seaborn, joblib
+
+================================================================================
+END OF NOTES
+================================================================================

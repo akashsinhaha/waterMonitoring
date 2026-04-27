@@ -1,0 +1,79 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+*.so
+*.pdb
+
+# Virtual environments
+.venv/
+venv/
+env/
+.env
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data & large binaries
+DATA_DIR/
+DATA_DIR_TS/
+*.tif
+*.tiff
+*.shp
+*.shx
+*.dbf
+*.prj
+*.cpg
+*.sbn
+*.sbx
+
+# Model outputs & results
+results_ensemble/
+results_unet/
+results_timeseries/
+old_results_timeseries/
+patches/
+*.pkl
+*.h5
+*.hdf5
+*.pt
+*.pth
+*.json.bak
+
+# XGBoost model
+*.xgb
+xgb_model.json
+
+# Plots & generated images (keep source, ignore outputs)
+*.png
+*.jpg
+*.jpeg
+*.pdf
+*.svg
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+
+# Misc
+*.tmp
+*.bak
+*.swp
+a/
