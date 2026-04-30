@@ -79,6 +79,24 @@ def add_water_mask_legend(m, year):
     return m
 
 
+def add_draw_control(m):
+    """Add a rectangle-only Draw plugin so users can select a custom AOI."""
+    from folium.plugins import Draw
+    Draw(
+        export=False,
+        draw_options={
+            'rectangle'   : True,
+            'polygon'     : False,
+            'circle'      : False,
+            'marker'      : False,
+            'circlemarker': False,
+            'polyline'    : False,
+        },
+        edit_options={'edit': False},
+    ).add_to(m)
+    return m
+
+
 def finalise_map(m):
     """Add layer control and return the map."""
     folium.LayerControl(collapsed=False).add_to(m)
