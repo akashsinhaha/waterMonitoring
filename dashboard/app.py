@@ -54,7 +54,40 @@ st.markdown("""
 
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
-def metric_card(label, value, delta=None, unit=''):
+def quality_status(metric_key, value):
+    """Return (status_label, color) for a quality metric value."""
+    if value is None or value != value:
+        return None
+    # For these metrics, lower is better
+    worse_when_higher = {
+        'ndti'    : (0.0,  0.10),
+        'ndci'    : (0.0,  0.05),
+        'sediment': (0.05, 0.15),
+    }
+    # For clarity, higher is better
+    better_when_higher = {
+        'clarity': (0.1, 0.05),
+    }
+    if metric_key in worse_when_higher:
+        good_threshold, fair_threshold = worse_when_higher[metric_key]
+        if value <= good_threshold:
+            return ('Good', '#2dc653')
+        elif value <= fair_threshold:
+            return ('Fair', '#f9c74f')
+        else:
+            return ('Poor', '#ef233c')
+    elif metric_key in better_when_higher:
+        good_threshold, fair_threshold = better_when_higher[metric_key]
+        if value >= good_threshold:
+            return ('Good', '#2dc653')
+        elif value >= fair_threshold:
+            return ('Fair', '#f9c74f')
+        else:
+            return ('Poor', '#ef233c')
+    return None
+
+
+def metric_card(label, value, delta=None, unit='', description='', status=None):
     if value is None:
         value_str = 'N/A'
     elif isinstance(value, float):
@@ -70,9 +103,21 @@ def metric_card(label, value, delta=None, unit=''):
         delta_html = (f'<div class="metric-delta {css_class}">'
                       f'{arrow} {sign}{delta:.3f} vs prev year</div>')
 
+    description_html = (f'<div style="font-size:11px;color:#888;margin-bottom:6px;">'
+                        f'{description}</div>') if description else ''
+
+    status_html = ''
+    if status is not None:
+        status_label, status_color = status
+        status_html = (f'<span style="float:right;font-size:11px;font-weight:600;'
+                       f'color:{status_color};background:rgba(255,255,255,0.06);'
+                       f'padding:2px 8px;border-radius:12px;">'
+                       f'{status_label}</span>')
+
     st.markdown(f"""
     <div class="metric-card">
-      <div class="metric-label">{label}</div>
+      <div class="metric-label">{status_html}{label}</div>
+      {description_html}
       <div class="metric-value">{value_str}</div>
       {delta_html}
     </div>
@@ -139,11 +184,11 @@ with st.sidebar:
     st.markdown('---')
     section('Quality Metrics')
     quality_options = {
-        'ndti'    : 'Turbidity (NDTI)',
-        'ndci'    : 'Chlorophyll-a (NDCI)',
-        'clarity' : 'Water Clarity',
-        'algae'   : 'Algae Index',
-        'sediment': 'Sediment',
+        'ndti'    : 'Water Muddiness',
+        'ndci'    : 'Algae Level',
+        'clarity' : 'Water Clearness',
+        'algae'   : 'Algae Bloom Risk',
+        'sediment': 'Soil & Sand',
     }
     selected_quality = [
         col for col, label in quality_options.items()
@@ -216,16 +261,35 @@ with stats_col:
     section(f'Statistics — {selected_year}')
     stats     = compute_stats_for_year(df, selected_year)
 
+    # Plain-language summary sentence
+    water_area = stats.get('water_area_km2')
+    area_pct   = stats.get('area_change_pct')
+    if water_area is not None:
+        if area_pct is not None and area_pct == area_pct:
+            direction_word = 'more' if area_pct >= 0 else 'less'
+            pct_abs        = abs(area_pct)
+            summary_text   = (f'The water body covered <strong>{water_area:.2f} km²</strong> '
+                              f'in {selected_year}, which is <strong>{pct_abs:.1f}% '
+                              f'{direction_word}</strong> than the previous year.')
+        else:
+            summary_text = (f'The water body covered <strong>{water_area:.2f} km²</strong> '
+                            f'in {selected_year}.')
+        st.markdown(f'<div style="background:#1a2a3a;border-left:3px solid #0077b6;'
+                    f'padding:10px 14px;border-radius:6px;font-size:13px;color:#ccc;'
+                    f'margin-bottom:12px;">{summary_text}</div>', unsafe_allow_html=True)
+
     metric_card('Water Area',
                 stats.get('water_area_km2'),
                 delta=stats.get('area_change_km2'),
-                unit=' km²')
+                unit=' km²',
+                description='Total surface area covered by water')
 
     pct = stats.get('area_change_pct')
     pct_str = f'{pct:+.1f}%' if pct is not None and pct == pct else 'N/A'
     st.markdown(f"""
     <div class="metric-card">
-      <div class="metric-label">% Change vs Previous Year</div>
+      <div class="metric-label">Change vs Previous Year</div>
+      <div style="font-size:11px;color:#888;margin-bottom:6px;">Did the water body grow or shrink?</div>
       <div class="metric-value" style="color: {'#2dc653' if (pct or 0) >= 0 else '#ef233c'}">
         {pct_str}
       </div>
@@ -233,23 +297,25 @@ with stats_col:
     """, unsafe_allow_html=True)
 
     st.markdown('<br>', unsafe_allow_html=True)
-    section('Water Quality')
+    section('Water Health')
 
     quality_labels = {
-        'ndti'    : ('Turbidity',     'Higher = more turbid'),
-        'ndci'    : ('Chlorophyll-a', 'Higher = more algae'),
-        'clarity' : ('Water Clarity', 'Higher = clearer'),
-        'sediment': ('Sediment',      'Higher = more sediment'),
+        'ndti'    : ('Water Muddiness',    'How cloudy or murky the water looks'),
+        'ndci'    : ('Algae Level',        'Amount of algae growing in the water'),
+        'clarity' : ('Water Clearness',    'How clear and see-through the water is'),
+        'sediment': ('Soil & Sand in Water', 'How much dirt is floating in the water'),
     }
 
     # Compute deltas from previous year
     prev_stats = compute_stats_for_year(df, selected_year - 1) if (selected_year - 1) in df.index else {}
 
-    for col, (label, note) in quality_labels.items():
+    for col, (plain_label, description_text) in quality_labels.items():
         val       = stats.get(col)
         prev_val  = prev_stats.get(col)
         delta     = (val - prev_val) if (val is not None and prev_val is not None) else None
-        metric_card(f'{label}', val, delta=delta)
+        status    = quality_status(col, val)
+        metric_card(plain_label, val, delta=delta,
+                    description=description_text, status=status)
 
 
 # ── ROW 2: CHART TABS ─────────────────────────────────────────────────────────

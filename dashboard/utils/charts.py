@@ -107,11 +107,11 @@ def quality_timeseries_chart(df, year_range, selected_metrics):
     selected_metrics: list of column names to plot.
     """
     metric_config = {
-        'ndti'    : ('Turbidity (NDTI)',     ORANGE),
-        'ndci'    : ('Chlorophyll-a (NDCI)', GREEN),
-        'clarity' : ('Water Clarity',        TEAL),
-        'algae'   : ('Algae Index',          PURPLE),
-        'sediment': ('Sediment (B4)',         '#ffd166'),
+        'ndti'    : ('Water Muddiness',    ORANGE),
+        'ndci'    : ('Algae Level',        GREEN),
+        'clarity' : ('Water Clearness',    TEAL),
+        'algae'   : ('Algae Bloom Risk',   PURPLE),
+        'sediment': ('Soil & Sand',        '#ffd166'),
     }
 
     filtered = df.loc[year_range[0]:year_range[1]]
@@ -148,7 +148,7 @@ def quality_timeseries_chart(df, year_range, selected_metrics):
             ))
 
     fig.update_layout(
-        **_base_layout('Water Quality Indices Over Time', height=400),
+        **_base_layout('Water Health Over Time', height=400),
         yaxis_title='Index Value',
         legend=dict(bgcolor='rgba(0,0,0,0)', font=dict(size=10),
                     orientation='h', y=-0.2),
