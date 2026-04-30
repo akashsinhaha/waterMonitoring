@@ -96,7 +96,7 @@ def metric_card(label, value, delta=None, unit='', description='', status=None):
         value_str = f'{value}{unit}'
 
     delta_html = ''
-    if delta is not None and not (delta != delta):   # not NaN
+    if delta is not None and not (delta != delta):   # not NaN 
         sign      = '+' if delta >= 0 else ''
         css_class = 'delta-pos' if delta >= 0 else 'delta-neg'
         arrow     = '▲' if delta >= 0 else '▼'
