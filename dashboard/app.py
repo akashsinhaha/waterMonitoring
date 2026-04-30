@@ -204,11 +204,59 @@ with st.sidebar:
             if st.checkbox(label, value=(col in ['ndti', 'ndci', 'clarity']))
         ]
     else:
-        # Defaults used by chart tabs (not shown in Custom AOI mode)
-        selected_year = available_years[-1]
-        year_range    = (available_years[0], available_years[-1])
-        quality_options  = {}
-        selected_quality = []
+        # Custom AOI sidebar controls
+        selected_year = available_years[-1]   # unused default
+
+        _c_cached = st.session_state.get('custom_results', {})
+        _c_yrs    = sorted(_c_cached.get('by_year', {}).keys()) if _c_cached else []
+
+        if len(_c_yrs) > 1:
+            st.markdown('---')
+            section('Change Detection Years')
+            _col_ca, _col_cb = st.columns(2)
+            with _col_ca:
+                st.caption('From')
+                custom_cd_year_a = st.selectbox(
+                    'From', _c_yrs[:-1], index=0,
+                    key='custom_cd_year_a', label_visibility='collapsed',
+                )
+            with _col_cb:
+                st.caption('To')
+                custom_cd_year_b = st.selectbox(
+                    'To', _c_yrs[1:], index=len(_c_yrs) - 2,
+                    key='custom_cd_year_b', label_visibility='collapsed',
+                )
+            st.markdown('---')
+            section('Chart Year Range')
+            year_range = st.slider(
+                'Year range',
+                min_value=_c_yrs[0], max_value=_c_yrs[-1],
+                value=(_c_yrs[0], _c_yrs[-1]),
+                label_visibility='collapsed', key='custom_year_range',
+            )
+        elif _c_yrs:
+            custom_cd_year_a = _c_yrs[0]
+            custom_cd_year_b = _c_yrs[0]
+            year_range       = (_c_yrs[0], _c_yrs[0])
+        else:
+            custom_cd_year_a = None
+            custom_cd_year_b = None
+            year_range       = (available_years[0], available_years[-1])
+
+        st.markdown('---')
+        section('Quality Metrics')
+        quality_options = {
+            'ndti'    : 'Water Muddiness',
+            'ndci'    : 'Algae Level',
+            'clarity' : 'Water Clearness',
+            'algae'   : 'Algae Bloom Risk',
+            'sediment': 'Soil & Sand',
+        }
+        selected_quality = [
+            col for col, label in quality_options.items()
+            if st.checkbox(label, value=(col in ['ndti', 'ndci', 'clarity']),
+                           key=f'cq_{col}')
+        ]
 
     st.markdown('---')
     section('GEE Status')
@@ -236,10 +284,16 @@ st.markdown('---')
 if mode == 'Custom AOI':
     # ── CUSTOM AOI LAYOUT ─────────────────────────────────────────────────────
     _cached_custom = st.session_state.get('custom_results', {})
+    _c_by_yr       = _cached_custom.get('by_year', {})
+
+    # Use sidebar-selected view years if available, else fall back to analysis range
+    _view_year_a = custom_cd_year_a if (custom_cd_year_a and custom_cd_year_a in _c_by_yr) else _cached_custom.get('start_year')
+    _view_year_b = custom_cd_year_b if (custom_cd_year_b and custom_cd_year_b in _c_by_yr) else _cached_custom.get('end_year')
     _is_multi_year = (
         bool(_cached_custom)
-        and _cached_custom.get('start_year') != _cached_custom.get('end_year')
-        and _cached_custom.get('change_png') is not None
+        and _view_year_a is not None
+        and _view_year_b is not None
+        and _view_year_a != _view_year_b
     )
 
     aoi_map_col, aoi_controls_col = st.columns([6, 4], gap='large')
@@ -251,28 +305,27 @@ if mode == 'Custom AOI':
         custom_map = create_base_map(map_bounds)
         custom_map = add_draw_control(custom_map)
 
-        if _cached_custom:
-            _rc_start = _cached_custom.get('start_year')
-            _rc_end   = _cached_custom.get('end_year')
+        if _cached_custom and _c_by_yr:
             if _is_multi_year:
-                custom_map = add_change_layer(
-                    custom_map, _rc_start, _rc_end,
-                    _cached_custom['change_png'],
-                    _cached_custom['change_bounds'],
-                )
-                for _yr, _yd in _cached_custom.get('by_year', {}).items():
-                    custom_map = add_water_mask_layer(
-                        custom_map, _yr, _yd['overlay_png'], _yd['overlay_bounds'],
-                        layer_name=f'Water Mask {_yr}',
+                _ma         = _c_by_yr[_view_year_a].get('water_mask')
+                _mb         = _c_by_yr[_view_year_b].get('water_mask')
+                _stored_crs = _cached_custom.get('raster_crs')
+                _stored_tfm = _cached_custom.get('raster_transform')
+                if _ma is not None and _mb is not None and _stored_crs and _stored_tfm:
+                    _dyn_chg_png, _dyn_chg_bnd = inference.build_change_overlay_png(
+                        _ma, _mb, _stored_crs, _stored_tfm
+                    )
+                    custom_map = add_change_layer(
+                        custom_map, _view_year_a, _view_year_b,
+                        _dyn_chg_png, _dyn_chg_bnd,
                     )
             else:
-                _yr_list = list(_cached_custom.get('by_year', {}).values())
-                if _yr_list:
-                    custom_map = add_water_mask_layer(
-                        custom_map, _rc_end,
-                        _yr_list[0]['overlay_png'], _yr_list[0]['overlay_bounds'],
-                        layer_name=f'Water Mask {_rc_end}',
-                    )
+                _single_data = _c_by_yr.get(_view_year_b) or next(iter(_c_by_yr.values()))
+                custom_map = add_water_mask_layer(
+                    custom_map, _view_year_b,
+                    _single_data['overlay_png'], _single_data['overlay_bounds'],
+                    layer_name=f'Water Mask {_view_year_b}',
+                )
 
         # Re-centre viewport on the AOI so overlays are visible
         _aoi_viewport_bounds = None
@@ -306,30 +359,27 @@ if mode == 'Custom AOI':
                 st.session_state.custom_aoi_geojson = _new_shape
 
         # Legend below map
-        if _cached_custom:
+        if _cached_custom and _c_by_yr:
             if _is_multi_year:
-                _ls, _le = _cached_custom['start_year'], _cached_custom['end_year']
                 st.markdown(f"""
                 <div style="display:flex;align-items:center;gap:16px;padding:8px 4px 2px;font-size:13px;color:#ccc;">
-                  <strong style="color:white;">Change {_ls} &rarr; {_le}</strong>
+                  <strong style="color:white;">Change {_view_year_a} &rarr; {_view_year_b}</strong>
                   <span><span style="background:#00b4d8;display:inline-block;width:14px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Stable Water</span>
                   <span><span style="background:#2dc653;display:inline-block;width:14px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Water Gain</span>
                   <span><span style="background:#ef233c;display:inline-block;width:14px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Water Loss</span>
                 </div>""", unsafe_allow_html=True)
             else:
-                st.markdown("""
+                st.markdown(f"""
                 <div style="display:flex;align-items:center;gap:16px;padding:8px 4px 2px;font-size:13px;color:#ccc;">
-                  <strong style="color:white;">Water Mask — Custom AOI</strong>
+                  <strong style="color:white;">Water Mask — {_view_year_b}</strong>
                   <span><span style="background:#0077b6;display:inline-block;width:14px;height:10px;border-radius:2px;vertical-align:middle;margin-right:4px;"></span>Water</span>
                 </div>""", unsafe_allow_html=True)
 
     with aoi_controls_col:
+        # ── Controls ──────────────────────────────────────────────────────────
         section('Analysis Settings')
 
         _drawn_aoi = st.session_state.get('custom_aoi_geojson')
-
-        # Also check if the map returned a new drawing this render cycle
-        # (handles versions where session_state isn't set yet)
         if _map_draw_output:
             _live = _map_draw_output.get('last_active_drawing')
             if _live is None:
@@ -339,11 +389,10 @@ if mode == 'Custom AOI':
                 _drawn_aoi = _live
 
         _step1_ok = _drawn_aoi is not None
-
         if _step1_ok:
-            st.success('✅ Step 1 — Area selected on map')
+            st.success('✅ Area selected on map')
         else:
-            st.info('⬜ Step 1 — Draw a rectangle on the map first\n\nClick the ▭ tool (top-left of map), drag to draw, then release.')
+            st.info('⬜ Draw a rectangle on the map first\n\nClick the ▭ tool (top-left of map), drag to draw, then release.')
 
         _yr_col_a, _yr_col_b = st.columns(2)
         with _yr_col_a:
@@ -360,9 +409,6 @@ if mode == 'Custom AOI':
         _years_valid = _custom_start_year <= _custom_end_year
         if not _years_valid:
             st.error('Start year must be ≤ end year.')
-        else:
-            _n_years = int(_custom_end_year) - int(_custom_start_year) + 1
-            st.caption(f'{"✅" if _years_valid else "⬜"} Step 2 — {_n_years} year(s) selected: {int(_custom_start_year)}–{int(_custom_end_year)}')
 
         _gee_project_input = st.text_input(
             'GEE Project ID',
@@ -372,7 +418,6 @@ if mode == 'Custom AOI':
             key='gee_project_input',
         )
         _project_ok = bool(_gee_project_input.strip())
-        st.caption(f'{"✅" if _project_ok else "⬜"} Step 3 — GEE Project ID entered')
 
         if _drawn_aoi:
             try:
@@ -384,18 +429,16 @@ if mode == 'Custom AOI':
                 pass
 
         _analyze_disabled = not (_step1_ok and _years_valid and _project_ok)
-
         if st.button('🔍 Analyze', disabled=_analyze_disabled,
-                     use_container_width=True, key='analyze_button',
-                     type='primary'):
+                     use_container_width=True, key='analyze_button', type='primary'):
             _analysis_error = None
             try:
                 with st.spinner('Connecting to Google Earth Engine...'):
                     gee_loader.init_gee(_gee_project_input.strip())
 
-                _tmp_dir    = tempfile.mkdtemp(prefix='rfwater_gee_')
-                _unet_model = inference.load_unet_model(config.UNET_MODEL_PATH)
-                _all_yr_res = {}
+                _tmp_dir      = tempfile.mkdtemp(prefix='rfwater_gee_')
+                _unet_model   = inference.load_unet_model(config.UNET_MODEL_PATH)
+                _all_yr_res   = {}
                 _last_crs = _last_tfm = None
                 _years_to_run = list(range(int(_custom_start_year), int(_custom_end_year) + 1))
 
@@ -426,12 +469,15 @@ if mode == 'Custom AOI':
 
                 st.session_state.custom_results = {
                     'by_year': {
-                        _yr: {k: v for k, v in _r.items() if k != 'water_mask'}
+                        _yr: _r   # keep water_mask for on-the-fly change overlays
                         for _yr, _r in _all_yr_res.items()
                     },
-                    'change_png': _chg_png, 'change_bounds': _chg_bnd,
-                    'start_year': int(_custom_start_year),
-                    'end_year'  : int(_custom_end_year),
+                    'change_png'      : _chg_png,
+                    'change_bounds'   : _chg_bnd,
+                    'start_year'      : int(_custom_start_year),
+                    'end_year'        : int(_custom_end_year),
+                    'raster_crs'      : _last_crs,
+                    'raster_transform': _last_tfm,
                 }
                 st.rerun()
 
@@ -443,41 +489,53 @@ if mode == 'Custom AOI':
             if _analysis_error:
                 st.error(_analysis_error)
 
-        # ── Results ───────────────────────────────────────────────────────────
-        if _cached_custom:
-            _rc_start  = _cached_custom['start_year']
-            _rc_end    = _cached_custom['end_year']
-            _by_yr     = _cached_custom.get('by_year', {})
+        # ── Statistics (identical layout to main stats column) ────────────────
+        if _cached_custom and _c_by_yr:
+            _by_yr = _c_by_yr
+            _es    = _by_yr.get(_view_year_b, {}).get('stats', {})
+            _ss    = _by_yr.get(_view_year_a, {}).get('stats', {}) if _is_multi_year else {}
+
+            _cst_water_area  = _es.get('water_area_km2')
+            _cst_area_delta  = (_cst_water_area - _ss.get('water_area_km2', 0)) if (_is_multi_year and _cst_water_area is not None) else None
+            _cst_area_pct    = ((_cst_area_delta / _ss['water_area_km2'] * 100)
+                                if (_cst_area_delta is not None and _ss.get('water_area_km2', 0) > 0)
+                                else None)
 
             st.markdown('---')
+            section(f'Statistics — {_view_year_b}')
 
-            if len(_by_yr) > 1:
-                import pandas as _pd
-                section(f'Water Area {_rc_start}–{_rc_end}')
-                _tbl = [
-                    {'Year': yr, 'Water Area (km²)': f"{_by_yr[yr]['stats'].get('water_area_km2', 0):.2f}"}
-                    for yr in sorted(_by_yr.keys())
-                ]
-                st.dataframe(_pd.DataFrame(_tbl).set_index('Year'), use_container_width=True)
+            # Summary sentence
+            if _cst_water_area is not None:
+                if _cst_area_pct is not None:
+                    _dir  = 'more' if _cst_area_pct >= 0 else 'less'
+                    _ref  = f'{_view_year_a}' if _is_multi_year else 'the previous year'
+                    _summ = (f'The water body covered <strong>{_cst_water_area:.2f} km²</strong> '
+                             f'in {_view_year_b}, which is <strong>{abs(_cst_area_pct):.1f}% '
+                             f'{_dir}</strong> than {_ref}.')
+                else:
+                    _summ = (f'The water body covered <strong>{_cst_water_area:.2f} km²</strong> '
+                             f'in {_view_year_b}.')
+                st.markdown(f'<div style="background:#1a2a3a;border-left:3px solid #0077b6;'
+                            f'padding:10px 14px;border-radius:6px;font-size:13px;color:#ccc;'
+                            f'margin-bottom:12px;">{_summ}</div>', unsafe_allow_html=True)
 
-                _a0 = _by_yr[_rc_start]['stats'].get('water_area_km2', 0)
-                _a1 = _by_yr[_rc_end]['stats'].get('water_area_km2', 0)
-                _dk = _a1 - _a0
-                _dp = (_dk / _a0 * 100) if _a0 > 0 else 0
-                _cc = '#2dc653' if _dk >= 0 else '#ef233c'
-                _cs = '+' if _dk >= 0 else ''
-                st.markdown(
-                    f'<div style="background:#1a2a3a;border-left:3px solid {_cc};'
-                    f'padding:10px 14px;border-radius:6px;font-size:13px;color:#ccc;margin-bottom:8px;">'
-                    f'Change {_rc_start}→{_rc_end}: '
-                    f'<strong style="color:{_cc};">{_cs}{_dk:.2f} km² ({_cs}{_dp:.1f}%)</strong></div>',
-                    unsafe_allow_html=True,
-                )
-
-            section(f'Water Health — {_rc_end}')
-            _es = _by_yr.get(_rc_end, {}).get('stats', {})
-            metric_card('Water Area', _es.get('water_area_km2'), unit=' km²',
+            metric_card('Water Area', _cst_water_area,
+                        delta=_cst_area_delta, unit=' km²',
                         description='Total surface area covered by water')
+
+            _pct_str  = f'{_cst_area_pct:+.1f}%' if _cst_area_pct is not None else 'N/A'
+            _pct_col  = '#2dc653' if (_cst_area_pct or 0) >= 0 else '#ef233c'
+            _pct_lbl  = f'Change vs {_view_year_a}' if _is_multi_year else 'Change vs Previous Year'
+            st.markdown(f"""
+            <div class="metric-card">
+              <div class="metric-label">{_pct_lbl}</div>
+              <div style="font-size:11px;color:#888;margin-bottom:6px;">Did the water body grow or shrink?</div>
+              <div class="metric-value" style="color:{_pct_col}">{_pct_str}</div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown('<br>', unsafe_allow_html=True)
+            section('Water Health')
 
             for _qk, (_ql, _qd) in {
                 'ndti'    : ('Water Muddiness',     'How cloudy or murky the water looks'),
@@ -486,7 +544,10 @@ if mode == 'Custom AOI':
                 'sediment': ('Soil & Sand in Water', 'How much dirt is floating in the water'),
             }.items():
                 _qv = _es.get(_qk)
-                metric_card(_ql, _qv, description=_qd, status=quality_status(_qk, _qv))
+                _sv = _ss.get(_qk) if _ss else None
+                _qd_val = (_qv - _sv) if (_qv is not None and _sv is not None) else None
+                metric_card(_ql, _qv, delta=_qd_val,
+                            description=_qd, status=quality_status(_qk, _qv))
 
             if st.button('🗑️ Clear Results', key='clear_custom_results', use_container_width=True):
                 st.session_state.pop('custom_results', None)
@@ -591,7 +652,89 @@ else:
                         description=description_text, status=quality_status(col, val))
 
 
-# ── ROW 2: CHART TABS (hidden in Custom AOI mode) ────────────────────────────
+# ── ROW 2: CHART TABS ────────────────────────────────────────────────────────
+if mode == 'Custom AOI' and _cached_custom and len(_c_by_yr) >= 1:
+    import pandas as _pd
+    # Build a DataFrame from custom results so we can reuse the same chart functions
+    _cst_rows = {
+        _yr: {
+            'water_area_km2': _c_by_yr[_yr]['stats'].get('water_area_km2', 0),
+            'ndti'          : _c_by_yr[_yr]['stats'].get('ndti'),
+            'ndci'          : _c_by_yr[_yr]['stats'].get('ndci'),
+            'clarity'       : _c_by_yr[_yr]['stats'].get('clarity'),
+            'algae'         : _c_by_yr[_yr]['stats'].get('algae'),
+            'sediment'      : _c_by_yr[_yr]['stats'].get('sediment'),
+        }
+        for _yr in sorted(_c_by_yr.keys())
+    }
+    _cst_df = _pd.DataFrame.from_dict(_cst_rows, orient='index')
+    _cst_df.index.name = 'year'
+    _cst_df['area_change_km2'] = _cst_df['water_area_km2'].diff()
+    _cst_df['area_change_pct'] = _cst_df['water_area_km2'].pct_change() * 100
+    _cst_yr_range = (year_range[0], year_range[1]) if year_range else (sorted(_c_by_yr.keys())[0], sorted(_c_by_yr.keys())[-1])
+
+    st.markdown('---')
+    _ctab_area, _ctab_quality, _ctab_change = st.tabs([
+        '📈 Water Area', '🔬 Water Health', '🗺️ Change Summary'
+    ])
+
+    with _ctab_area:
+        _cc1, _cc2 = st.columns([6, 4], gap='large')
+        with _cc1:
+            st.plotly_chart(area_timeseries_chart(_cst_df, _cst_yr_range), use_container_width=True)
+        with _cc2:
+            st.plotly_chart(yoy_change_chart(_cst_df, _cst_yr_range), use_container_width=True)
+        st.markdown('---')
+        section('Data Table')
+        _cst_disp = _cst_df.loc[_cst_yr_range[0]:_cst_yr_range[1],
+                                 ['water_area_km2', 'area_change_km2', 'area_change_pct']].copy()
+        _cst_disp.columns = ['Area (km²)', 'Change (km²)', 'Change (%)']
+        st.dataframe(
+            _cst_disp.style.format({
+                'Area (km²)'  : '{:.3f}',
+                'Change (km²)': '{:+.3f}',
+                'Change (%)'  : '{:+.1f}',
+            }).background_gradient(subset=['Area (km²)'], cmap='Blues'),
+            use_container_width=True,
+        )
+
+    with _ctab_quality:
+        if not selected_quality:
+            st.info('Select at least one quality metric from the sidebar.')
+        else:
+            st.plotly_chart(
+                quality_timeseries_chart(_cst_df, _cst_yr_range, selected_quality),
+                use_container_width=True,
+            )
+            st.markdown('---')
+            section('Quality Data Table')
+            _cst_q_df = _cst_df.loc[_cst_yr_range[0]:_cst_yr_range[1],
+                                     [c for c in selected_quality if c in _cst_df.columns]]
+            _cst_q_df.columns = [quality_options.get(c, c) for c in _cst_q_df.columns]
+            st.dataframe(_cst_q_df.style.format('{:.4f}'), use_container_width=True)
+
+    with _ctab_change:
+        st.plotly_chart(change_summary_chart(_cst_df, _cst_yr_range), use_container_width=True)
+        st.markdown('---')
+        section('Overall Change Summary')
+        _cst_yrs_sorted = sorted(_c_by_yr.keys())
+        _cst_fy, _cst_ly = _cst_yrs_sorted[0], _cst_yrs_sorted[-1]
+        _cst_af = _cst_df.loc[_cst_fy, 'water_area_km2']
+        _cst_al = _cst_df.loc[_cst_ly, 'water_area_km2']
+        _cst_tc = _cst_al - _cst_af
+        _cst_tp = (_cst_tc / _cst_af * 100) if _cst_af > 0 else 0
+        _cc1, _cc2, _cc3 = st.columns(3)
+        with _cc1:
+            metric_card(f'Area in {_cst_fy}', _cst_af, unit=' km²')
+        with _cc2:
+            metric_card(f'Area in {_cst_ly}', _cst_al, unit=' km²')
+        with _cc3:
+            metric_card('Total Change', _cst_tc, unit=' km²')
+            _tc_sign  = '+' if _cst_tp >= 0 else ''
+            _tc_color = '#2dc653' if _cst_tp >= 0 else '#ef233c'
+            st.markdown(f'<div style="color:{_tc_color};font-size:18px;font-weight:700;">'
+                        f'{_tc_sign}{_cst_tp:.1f}% overall</div>', unsafe_allow_html=True)
+
 if mode != 'Custom AOI':
     st.markdown('---')
     tab_area, tab_quality, tab_change = st.tabs([
