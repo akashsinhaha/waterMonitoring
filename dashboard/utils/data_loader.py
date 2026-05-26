@@ -10,7 +10,7 @@ from PIL import Image
 import streamlit as st
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from config import RESULTS_DIR, YEARS, PIXEL_AREA_KM2, MAP_OVERLAY_MAX_PX
+from config import RESULTS_DIR, YEARS, FORECAST_YEARS, PIXEL_AREA_KM2, MAP_OVERLAY_MAX_PX
 
 
 @st.cache_data
@@ -18,7 +18,24 @@ def load_summary():
     """Load precomputed timeseries summary CSV."""
     csv_path = os.path.join(RESULTS_DIR, 'timeseries_summary.csv')
     df = pd.read_csv(csv_path, index_col='year')
+    # Backfill is_forecast column for CSVs written before the forecast feature
+    if 'is_forecast' not in df.columns:
+        df['is_forecast'] = False
+    else:
+        df['is_forecast'] = df['is_forecast'].fillna(False).astype(bool)
     return df
+
+
+def is_forecast_year(year):
+    """Return True if year is a model-predicted forecast, not an observed year."""
+    return year in FORECAST_YEARS
+
+
+@st.cache_data
+def get_available_mask_years(years):
+    """Return only years that have a water mask file on disk."""
+    masks_dir = os.path.join(RESULTS_DIR, 'water_masks')
+    return [y for y in years if os.path.exists(os.path.join(masks_dir, f'water_mask_{y}.tif'))]
 
 
 @st.cache_data
@@ -159,8 +176,7 @@ def compute_stats_for_year(df, year):
     if year not in df.index:
         return {}
 
-    row     = df.loc[year]
-    prev    = df.loc[year - 1] if (year - 1) in df.index else None
+    row = df.loc[year]
 
     stats = {
         'water_area_km2'   : row.get('water_area_km2', None),
@@ -171,5 +187,6 @@ def compute_stats_for_year(df, year):
         'clarity'          : row.get('clarity', None),
         'sediment'         : row.get('sediment', None),
         'algae'            : row.get('algae', None),
+        'is_forecast'      : bool(row.get('is_forecast', False)),
     }
     return stats

@@ -16,6 +16,7 @@ from utils.data_loader import (
     load_summary, load_water_mask,
     get_map_bounds, mask_to_overlay_png,
     change_map_to_overlay_png, compute_stats_for_year,
+    is_forecast_year, get_available_mask_years,
 )
 from utils.charts import (
     area_timeseries_chart, yoy_change_chart,
@@ -139,9 +140,10 @@ def section(title):
 
 # ── LOAD DATA ─────────────────────────────────────────────────────────────────
 with st.spinner('Loading data...'):
-    df         = load_summary()
-    map_bounds = get_map_bounds()
-    available_years = [y for y in YEARS if y in df.index]
+    df              = load_summary()
+    map_bounds      = get_map_bounds()
+    mask_years      = get_available_mask_years(YEARS)
+    available_years = [y for y in YEARS if y in df.index and y in mask_years]
 
 
 # ── SIDEBAR ───────────────────────────────────────────────────────────────────
@@ -158,7 +160,7 @@ with st.sidebar:
 
     if mode != 'Custom AOI':
         st.markdown('---')
-        section('Map Year' if mode == 'Water Mask' else 'Change Detection Years')
+        section('Map Year' if mode == 'Water Mask' else 'Change Detection Years (2017 - 2025)')
 
         if mode == 'Water Mask':
             selected_year = st.select_slider(
@@ -167,6 +169,8 @@ with st.sidebar:
                 value=available_years[-1],
                 label_visibility='collapsed',
             )
+            if is_forecast_year(selected_year):
+                st.caption('🔮 Forecast year — predicted by ConvLSTM model')
         else:
             col_a, col_b = st.columns(2)
             with col_a:
@@ -376,118 +380,121 @@ if mode == 'Custom AOI':
                 </div>""", unsafe_allow_html=True)
 
     with aoi_controls_col:
-        # ── Controls ──────────────────────────────────────────────────────────
-        section('Analysis Settings')
+        _results_are_visible = bool(_cached_custom and _c_by_yr)
 
-        _drawn_aoi = st.session_state.get('custom_aoi_geojson')
-        if _map_draw_output:
-            _live = _map_draw_output.get('last_active_drawing')
-            if _live is None:
-                _all_live = _map_draw_output.get('all_drawings') or []
-                _live = _all_live[-1] if _all_live else None
-            if _live:
-                _drawn_aoi = _live
+        if not _results_are_visible:
+            # ── Controls ──────────────────────────────────────────────────────────
+            section('Analysis Settings')
 
-        _step1_ok = _drawn_aoi is not None
-        if _step1_ok:
-            st.success('✅ Area selected on map')
-        else:
-            st.info('⬜ Draw a rectangle on the map first\n\nClick the ▭ tool (top-left of map), drag to draw, then release.')
+            _drawn_aoi = st.session_state.get('custom_aoi_geojson')
+            if _map_draw_output:
+                _live = _map_draw_output.get('last_active_drawing')
+                if _live is None:
+                    _all_live = _map_draw_output.get('all_drawings') or []
+                    _live = _all_live[-1] if _all_live else None
+                if _live:
+                    _drawn_aoi = _live
 
-        _yr_col_a, _yr_col_b = st.columns(2)
-        with _yr_col_a:
-            _custom_start_year = st.number_input(
-                'Start Year', min_value=2000, max_value=2030,
-                value=2022, step=1, key='custom_start_year',
+            _step1_ok = _drawn_aoi is not None
+            if _step1_ok:
+                st.success('✅ Area selected on map')
+            else:
+                st.info('⬜ Draw a rectangle on the map first\n\nClick the ▭ tool (top-left of map), drag to draw, then release.')
+
+            _yr_col_a, _yr_col_b = st.columns(2)
+            with _yr_col_a:
+                _custom_start_year = st.number_input(
+                    'Start Year', min_value=2000, max_value=2030,
+                    value=2022, step=1, key='custom_start_year',
+                )
+            with _yr_col_b:
+                _custom_end_year = st.number_input(
+                    'End Year', min_value=2000, max_value=2030,
+                    value=2024, step=1, key='custom_end_year',
+                )
+
+            _years_valid = _custom_start_year <= _custom_end_year
+            if not _years_valid:
+                st.error('Start year must be ≤ end year.')
+
+            _gee_project_input = st.text_input(
+                'GEE Project ID',
+                value=config.GEE_PROJECT,
+                placeholder='e.g. my-gee-project-123',
+                help='Your Google Earth Engine project ID.',
+                key='gee_project_input',
             )
-        with _yr_col_b:
-            _custom_end_year = st.number_input(
-                'End Year', min_value=2000, max_value=2030,
-                value=2024, step=1, key='custom_end_year',
-            )
+            _project_ok = bool(_gee_project_input.strip())
 
-        _years_valid = _custom_start_year <= _custom_end_year
-        if not _years_valid:
-            st.error('Start year must be ≤ end year.')
+            if _drawn_aoi:
+                try:
+                    _aoi_km2 = gee_loader.check_aoi_size_km2(_drawn_aoi)
+                    st.caption(f'Selected area: ~{_aoi_km2:.0f} km²')
+                    if _aoi_km2 > config.AOI_MAX_KM2:
+                        st.warning(f'Large area (~{_aoi_km2:.0f} km²). Downloads may take several minutes.')
+                except Exception:
+                    pass
 
-        _gee_project_input = st.text_input(
-            'GEE Project ID',
-            value=config.GEE_PROJECT,
-            placeholder='e.g. my-gee-project-123',
-            help='Your Google Earth Engine project ID.',
-            key='gee_project_input',
-        )
-        _project_ok = bool(_gee_project_input.strip())
+            _analyze_disabled = not (_step1_ok and _years_valid and _project_ok)
+            if st.button('🔍 Analyze', disabled=_analyze_disabled,
+                         use_container_width=True, key='analyze_button', type='primary'):
+                _analysis_error = None
+                try:
+                    with st.spinner('Connecting to Google Earth Engine...'):
+                        gee_loader.init_gee(_gee_project_input.strip())
 
-        if _drawn_aoi:
-            try:
-                _aoi_km2 = gee_loader.check_aoi_size_km2(_drawn_aoi)
-                st.caption(f'Selected area: ~{_aoi_km2:.0f} km²')
-                if _aoi_km2 > config.AOI_MAX_KM2:
-                    st.warning(f'Large area (~{_aoi_km2:.0f} km²). Downloads may take several minutes.')
-            except Exception:
-                pass
+                    _tmp_dir      = tempfile.mkdtemp(prefix='rfwater_gee_')
+                    _unet_model   = inference.load_unet_model(config.UNET_MODEL_PATH)
+                    _all_yr_res   = {}
+                    _last_crs = _last_tfm = None
+                    _years_to_run = list(range(int(_custom_start_year), int(_custom_end_year) + 1))
 
-        _analyze_disabled = not (_step1_ok and _years_valid and _project_ok)
-        if st.button('🔍 Analyze', disabled=_analyze_disabled,
-                     use_container_width=True, key='analyze_button', type='primary'):
-            _analysis_error = None
-            try:
-                with st.spinner('Connecting to Google Earth Engine...'):
-                    gee_loader.init_gee(_gee_project_input.strip())
+                    for _idx, _yr in enumerate(_years_to_run):
+                        with st.spinner(f'Downloading data — {_yr} ({_idx+1}/{len(_years_to_run)})...'):
+                            _s2_p, _s1a_p, _s1d_p = gee_loader.download_sentinel_composite(
+                                _drawn_aoi, _yr, _tmp_dir
+                            )
+                        with st.spinner(f'Running model — {_yr}...'):
+                            _s2f, _s2u, _s1a, _s1d, _crs, _tfm = \
+                                inference.load_rasters_from_paths(_s2_p, _s1a_p, _s1d_p)
+                            _wmask, _ = inference.run_unet_inference(_unet_model, _s2u, _s1a, _s1d)
+                            _stats    = inference.compute_quality_stats(_s2f, _wmask)
+                            _ov_png, _ov_bnd = inference.mask_array_to_overlay_png(_wmask, _crs, _tfm)
+                            _all_yr_res[_yr] = {
+                                'water_mask': _wmask, 'stats': _stats,
+                                'overlay_png': _ov_png, 'overlay_bounds': _ov_bnd,
+                            }
+                            _last_crs, _last_tfm = _crs, _tfm
 
-                _tmp_dir      = tempfile.mkdtemp(prefix='rfwater_gee_')
-                _unet_model   = inference.load_unet_model(config.UNET_MODEL_PATH)
-                _all_yr_res   = {}
-                _last_crs = _last_tfm = None
-                _years_to_run = list(range(int(_custom_start_year), int(_custom_end_year) + 1))
-
-                for _idx, _yr in enumerate(_years_to_run):
-                    with st.spinner(f'Downloading data — {_yr} ({_idx+1}/{len(_years_to_run)})...'):
-                        _s2_p, _s1a_p, _s1d_p = gee_loader.download_sentinel_composite(
-                            _drawn_aoi, _yr, _tmp_dir
+                    _chg_png = _chg_bnd = None
+                    if len(_years_to_run) > 1:
+                        _chg_png, _chg_bnd = inference.build_change_overlay_png(
+                            _all_yr_res[int(_custom_start_year)]['water_mask'],
+                            _all_yr_res[int(_custom_end_year)]['water_mask'],
+                            _last_crs, _last_tfm,
                         )
-                    with st.spinner(f'Running model — {_yr}...'):
-                        _s2f, _s2u, _s1a, _s1d, _crs, _tfm = \
-                            inference.load_rasters_from_paths(_s2_p, _s1a_p, _s1d_p)
-                        _wmask, _ = inference.run_unet_inference(_unet_model, _s2u, _s1a, _s1d)
-                        _stats    = inference.compute_quality_stats(_s2f, _wmask)
-                        _ov_png, _ov_bnd = inference.mask_array_to_overlay_png(_wmask, _crs, _tfm)
-                        _all_yr_res[_yr] = {
-                            'water_mask': _wmask, 'stats': _stats,
-                            'overlay_png': _ov_png, 'overlay_bounds': _ov_bnd,
-                        }
-                        _last_crs, _last_tfm = _crs, _tfm
 
-                _chg_png = _chg_bnd = None
-                if len(_years_to_run) > 1:
-                    _chg_png, _chg_bnd = inference.build_change_overlay_png(
-                        _all_yr_res[int(_custom_start_year)]['water_mask'],
-                        _all_yr_res[int(_custom_end_year)]['water_mask'],
-                        _last_crs, _last_tfm,
-                    )
+                    st.session_state.custom_results = {
+                        'by_year': {
+                            _yr: _r   # keep water_mask for on-the-fly change overlays
+                            for _yr, _r in _all_yr_res.items()
+                        },
+                        'change_png'      : _chg_png,
+                        'change_bounds'   : _chg_bnd,
+                        'start_year'      : int(_custom_start_year),
+                        'end_year'        : int(_custom_end_year),
+                        'raster_crs'      : _last_crs,
+                        'raster_transform': _last_tfm,
+                    }
+                    st.rerun()
 
-                st.session_state.custom_results = {
-                    'by_year': {
-                        _yr: _r   # keep water_mask for on-the-fly change overlays
-                        for _yr, _r in _all_yr_res.items()
-                    },
-                    'change_png'      : _chg_png,
-                    'change_bounds'   : _chg_bnd,
-                    'start_year'      : int(_custom_start_year),
-                    'end_year'        : int(_custom_end_year),
-                    'raster_crs'      : _last_crs,
-                    'raster_transform': _last_tfm,
-                }
-                st.rerun()
+                except RuntimeError as _e:
+                    _analysis_error = str(_e)
+                except Exception as _e:
+                    _analysis_error = f'Analysis failed: {_e}'
 
-            except RuntimeError as _e:
-                _analysis_error = str(_e)
-            except Exception as _e:
-                _analysis_error = f'Analysis failed: {_e}'
-
-            if _analysis_error:
-                st.error(_analysis_error)
+                if _analysis_error:
+                    st.error(_analysis_error)
 
         # ── Statistics (identical layout to main stats column) ────────────────
         if _cached_custom and _c_by_yr:
@@ -503,6 +510,16 @@ if mode == 'Custom AOI':
 
             st.markdown('---')
             section(f'Statistics — {_view_year_b}')
+
+            if _by_yr.get(_view_year_b, {}).get('is_forecast'):
+                st.markdown(
+                    '<div style="background:rgba(239,35,60,0.12);border:1px solid #ef233c;'
+                    'border-radius:8px;padding:8px 14px;margin-bottom:10px;font-size:13px;color:#ef233c;">'
+                    '⚠️ <strong>Forecast year</strong> — values are ConvLSTM predictions, '
+                    'not observations. Quality metrics are unavailable.'
+                    '</div>',
+                    unsafe_allow_html=True,
+                )
 
             # Summary sentence
             if _cst_water_area is not None:
@@ -549,6 +566,89 @@ if mode == 'Custom AOI':
                 metric_card(_ql, _qv, delta=_qd_val,
                             description=_qd, status=quality_status(_qk, _qv))
 
+            # ── ConvLSTM spatial forecast ─────────────────────────────────────
+            st.markdown('---')
+            section('Spatial Forecast (ConvLSTM)')
+
+            _observed_years       = [y for y in _by_yr if not _by_yr[y].get('is_forecast')]
+            _forecast_year        = max(_observed_years) + 1
+            _forecast_already_run = any(_by_yr[y].get('is_forecast') for y in _by_yr)
+            _enough_years         = len(_observed_years) >= config.CONVLSTM_SEQUENCE_LEN
+            _model_exists         = os.path.exists(config.CONVLSTM_MODEL_PATH)
+
+            if _forecast_already_run:
+                _fc_area = _by_yr[_forecast_year]['stats'].get('water_area_km2', 0)
+                st.success(
+                    f'🔮 Forecast for {_forecast_year} complete — '
+                    f'{_fc_area:.2f} km² predicted water area.'
+                )
+            else:
+                if not _model_exists:
+                    st.warning(
+                        f'ConvLSTM checkpoint not found.\n\n'
+                        f'Run `python water_spatial_forecast.py` first to train the model.'
+                    )
+                elif not _enough_years:
+                    st.info(
+                        f'Need at least {config.CONVLSTM_SEQUENCE_LEN} years of data to run '
+                        f'the spatial forecast. Currently have {len(_by_yr)}.'
+                    )
+                else:
+                    st.caption(
+                        f'Uses last {config.CONVLSTM_SEQUENCE_LEN} years as input to predict '
+                        f'{_forecast_year}.'
+                    )
+
+                _forecast_disabled = not (_enough_years and _model_exists and not _forecast_already_run)
+                if st.button(
+                    f'🔮 Forecast {_forecast_year}',
+                    disabled=_forecast_disabled,
+                    use_container_width=True,
+                    key='run_convlstm_forecast',
+                    type='primary',
+                ):
+                    _forecast_error = None
+                    try:
+                        _input_years_for_forecast = sorted(_by_yr.keys())[-config.CONVLSTM_SEQUENCE_LEN:]
+                        with st.spinner(f'Loading ConvLSTM model...'):
+                            _convlstm_model = inference.load_convlstm_model(config.CONVLSTM_MODEL_PATH)
+
+                        with st.spinner(f'Running spatial forecast for {_forecast_year}...'):
+                            _masks_for_forecast = {
+                                _yr: _by_yr[_yr]['water_mask']
+                                for _yr in _input_years_for_forecast
+                            }
+                            _fc_prob_map, _fc_mask = inference.run_convlstm_forecast(
+                                _convlstm_model, _masks_for_forecast, _input_years_for_forecast
+                            )
+                            _fc_area_km2  = float(_fc_mask.sum()) * (10 * 10 / 1e6)
+                            _fc_ov_png, _fc_ov_bnd = inference.mask_array_to_overlay_png(
+                                _fc_mask,
+                                _cached_custom['raster_crs'],
+                                _cached_custom['raster_transform'],
+                                color=(239, 35, 60),   # red tint to distinguish forecast
+                            )
+
+                        st.session_state.custom_results['by_year'][_forecast_year] = {
+                            'water_mask'    : _fc_mask,
+                            'stats'         : {
+                                'water_area_km2': _fc_area_km2,
+                                'ndti': None, 'ndci': None,
+                                'clarity': None, 'algae': None, 'sediment': None,
+                            },
+                            'overlay_png'   : _fc_ov_png,
+                            'overlay_bounds': _fc_ov_bnd,
+                            'is_forecast'   : True,
+                        }
+                        st.rerun()
+
+                    except Exception as _fc_err:
+                        _forecast_error = f'Forecast failed: {_fc_err}'
+
+                    if _forecast_error:
+                        st.error(_forecast_error)
+
+            st.markdown('---')
             if st.button('🗑️ Clear Results', key='clear_custom_results', use_container_width=True):
                 st.session_state.pop('custom_results', None)
                 st.session_state.pop('custom_aoi_geojson', None)
@@ -596,6 +696,14 @@ else:
 
 
     with stats_col:
+        if is_forecast_year(selected_year):
+            st.markdown(
+                '<div style="background:rgba(239,35,60,0.12);border:1px solid #ef233c;'
+                'border-radius:8px;padding:8px 14px;margin-bottom:10px;font-size:13px;color:#ef233c;">'
+                '⚠️ <strong>Forecast year</strong> — values are model predictions, not observations.'
+                '</div>',
+                unsafe_allow_html=True,
+            )
         section(f'Statistics — {selected_year}')
         stats = compute_stats_for_year(df, selected_year)
 

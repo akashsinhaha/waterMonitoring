@@ -1,10 +1,12 @@
 """
-U-Net inference utilities for the Custom AOI tab.
-Extracted and adapted from water_timeseries.py.
+U-Net and ConvLSTM inference utilities for the Custom AOI tab.
 
-Architecture must exactly match the saved weights in results_unet/unet_best.pth.
+U-Net architecture must exactly match the saved weights in results_unet/unet_best.pth.
+ConvLSTM architecture must exactly match the saved weights in
+results_timeseries/forecast/convlstm_best.pth (trained by water_spatial_forecast.py).
 """
 import io
+import os
 import base64
 
 import numpy as np
@@ -287,6 +289,173 @@ def build_change_overlay_png(mask_start, mask_end, crs, transform,
         max(raster_left, raster_right), max(raster_top,  raster_bottom),
     )
     return f'data:image/png;base64,{encoded}', [[south, west], [north, east]]
+
+
+
+# ── CONVLSTM ARCHITECTURE (must match water_spatial_forecast.py weights) ──────
+
+_CONVLSTM_HIDDEN_CHANNELS = 16
+_CONVLSTM_KERNEL_SIZE     = 3
+_CONVLSTM_PATCH_SIZE      = 256
+_CONVLSTM_STRIDE          = 128
+
+
+class _ConvLSTMCell(torch.nn.Module):
+    def __init__(self, input_channels, hidden_channels, kernel_size=3):
+        super().__init__()
+        self.hidden_channels = hidden_channels
+        padding = kernel_size // 2
+        self.fused_gates_conv = torch.nn.Conv2d(
+            input_channels + hidden_channels,
+            4 * hidden_channels,
+            kernel_size=kernel_size,
+            padding=padding,
+            bias=True,
+        )
+
+    def forward(self, input_frame, hidden_state):
+        h_previous, c_previous = hidden_state
+        concatenated_input = torch.cat([input_frame, h_previous], dim=1)
+        all_gate_outputs   = self.fused_gates_conv(concatenated_input)
+
+        input_gate, forget_gate, cell_gate, output_gate = torch.chunk(all_gate_outputs, 4, dim=1)
+        input_gate  = torch.sigmoid(input_gate)
+        forget_gate = torch.sigmoid(forget_gate)
+        cell_gate   = torch.tanh(cell_gate)
+        output_gate = torch.sigmoid(output_gate)
+
+        c_next = forget_gate * c_previous + input_gate * cell_gate
+        h_next = output_gate * torch.tanh(c_next)
+        return h_next, c_next
+
+    def init_hidden(self, batch_size, spatial_height, spatial_width, device):
+        zeros = torch.zeros(
+            batch_size, self.hidden_channels, spatial_height, spatial_width, device=device
+        )
+        return zeros, zeros.clone()
+
+
+class _ConvLSTMForecaster(torch.nn.Module):
+    def __init__(self, hidden_channels=_CONVLSTM_HIDDEN_CHANNELS,
+                 kernel_size=_CONVLSTM_KERNEL_SIZE):
+        super().__init__()
+        self.convlstm_cell = _ConvLSTMCell(
+            input_channels=1,
+            hidden_channels=hidden_channels,
+            kernel_size=kernel_size,
+        )
+        self.prediction_head = torch.nn.Sequential(
+            torch.nn.Conv2d(hidden_channels, hidden_channels // 2, kernel_size=3, padding=1),
+            torch.nn.ReLU(inplace=True),
+            torch.nn.Conv2d(hidden_channels // 2, 1, kernel_size=1),
+        )
+
+    def forward(self, sequence_tensor):
+        batch_size, seq_len, _, spatial_height, spatial_width = sequence_tensor.shape
+        device = sequence_tensor.device
+        h_state, c_state = self.convlstm_cell.init_hidden(
+            batch_size, spatial_height, spatial_width, device
+        )
+        for timestep_idx in range(seq_len):
+            current_frame = sequence_tensor[:, timestep_idx]   # (B, 1, H, W)
+            h_state, c_state = self.convlstm_cell(current_frame, (h_state, c_state))
+        return self.prediction_head(h_state)   # (B, 1, H, W) logits
+
+
+def load_convlstm_model(model_path):
+    """
+    Load the pre-trained ConvLSTMForecaster checkpoint.
+    Raises FileNotFoundError with instructions if the checkpoint is missing.
+    Returns model in eval mode on the best available device.
+    """
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(
+            f'ConvLSTM checkpoint not found: {model_path}\n'
+            'Run  python water_spatial_forecast.py  first to train and save the model.'
+        )
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model  = _ConvLSTMForecaster(
+        hidden_channels=_CONVLSTM_HIDDEN_CHANNELS,
+        kernel_size=_CONVLSTM_KERNEL_SIZE,
+    ).to(device)
+    model.load_state_dict(torch.load(model_path, map_location=device))
+    model.eval()
+    return model
+
+
+def run_convlstm_forecast(model, annual_masks_by_year, input_years):
+    """
+    Run the pre-trained ConvLSTM on in-memory water masks from a custom AOI.
+
+    Uses the same patch-based overlap-averaging strategy as the standalone
+    water_spatial_forecast.py script, so the inference is spatially consistent
+    regardless of AOI size.  Small AOIs (< 256 px) are padded via reflection
+    before inference and cropped back afterwards.
+
+    Parameters
+    ----------
+    model                : _ConvLSTMForecaster loaded via load_convlstm_model()
+    annual_masks_by_year : dict of year (int) → (H, W) uint8 binary water mask
+    input_years          : list of exactly CONVLSTM_SEQUENCE_LEN years to feed as input
+
+    Returns
+    -------
+    probability_map : (H, W) float32  per-pixel water probability [0, 1]
+    predicted_mask  : (H, W) uint8    binary mask thresholded at 0.5
+    """
+    device = next(model.parameters()).device
+
+    reference_mask   = annual_masks_by_year[input_years[0]].astype(np.float32)
+    orig_height, orig_width = reference_mask.shape
+
+    # Stack input years → (T, H, W) float32
+    spatial_input = np.stack(
+        [annual_masks_by_year[y].astype(np.float32) for y in input_years], axis=0
+    )
+
+    # Pad so the sliding window executes at least once
+    pad_h = max(0, _CONVLSTM_PATCH_SIZE - orig_height)
+    pad_w = max(0, _CONVLSTM_PATCH_SIZE - orig_width)
+    if pad_h > 0 or pad_w > 0:
+        spatial_input = np.pad(
+            spatial_input, ((0, 0), (0, pad_h), (0, pad_w)), mode='reflect'
+        )
+
+    _, full_height, full_width = spatial_input.shape
+
+    prediction_sum_map   = np.zeros((full_height, full_width), dtype=np.float32)
+    prediction_count_map = np.zeros((full_height, full_width), dtype=np.float32)
+
+    with torch.no_grad():
+        for row_start in range(0, full_height - _CONVLSTM_PATCH_SIZE + 1, _CONVLSTM_STRIDE):
+            for col_start in range(0, full_width - _CONVLSTM_PATCH_SIZE + 1, _CONVLSTM_STRIDE):
+                row_end = row_start + _CONVLSTM_PATCH_SIZE
+                col_end = col_start + _CONVLSTM_PATCH_SIZE
+
+                patch_array = spatial_input[:, row_start:row_end, col_start:col_end]  # (T,256,256)
+                # ConvLSTM expects (B, T, C, H, W) → (1, T, 1, 256, 256)
+                patch_tensor = (
+                    torch.from_numpy(patch_array)
+                    .unsqueeze(0).unsqueeze(2)
+                    .to(device).float()
+                )
+
+                predicted_logits  = model(patch_tensor).squeeze().cpu().numpy()   # (256, 256)
+                patch_probability = 1.0 / (1.0 + np.exp(-predicted_logits))       # sigmoid
+
+                prediction_sum_map[row_start:row_end, col_start:col_end]   += patch_probability
+                prediction_count_map[row_start:row_end, col_start:col_end] += 1
+
+    valid_pixels    = prediction_count_map > 0
+    probability_map = np.zeros((full_height, full_width), dtype=np.float32)
+    probability_map[valid_pixels] = (
+        prediction_sum_map[valid_pixels] / prediction_count_map[valid_pixels]
+    )
+
+    # Crop back to original dimensions before padding
+    probability_map = probability_map[:orig_height, :orig_width]
+    predicted_mask  = (probability_map > 0.5).astype(np.uint8)
+    return probability_map, predicted_mask
 
 
 def mask_array_to_overlay_png(water_mask, crs, transform,

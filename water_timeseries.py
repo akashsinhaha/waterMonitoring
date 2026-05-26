@@ -301,7 +301,7 @@ def build_summary(all_masks):
         quality = compute_quality_indices(s2_full, water_mask)
 
         row = {'year': year, 'water_pixels': water_pixels,
-               'water_area_km2': water_area_km2}
+               'water_area_km2': water_area_km2, 'is_forecast': False}
         row.update(quality)
         rows.append(row)
         print(f'  {year}: {water_area_km2:.2f} km²  '
@@ -552,6 +552,222 @@ def plot_summary_dashboard(df, all_masks):
     print(f'  Saved: {path}')
 
 
+# ── TEMPORAL FORECASTING ─────────────────────────────────────────────────────
+
+def append_forecast_to_csv(observed_df, forecast_results):
+    """
+    Append (or overwrite) the forecast year row in timeseries_summary.csv.
+    The row is tagged is_forecast=True so the dashboard can distinguish it.
+    """
+    csv_path       = os.path.join(RESULTS_DIR, 'timeseries_summary.csv')
+    forecast_year  = forecast_results['year']
+    last_area      = observed_df['water_area_km2'].iloc[-1]
+    forecast_area  = forecast_results['water_area_km2']
+
+    forecast_row_data = {
+        'water_pixels'   : np.nan,
+        'water_area_km2' : forecast_area,
+        'is_forecast'    : True,
+        'mndwi'          : np.nan,
+        'ndti'           : forecast_results.get('ndti',     np.nan),
+        'ndci'           : forecast_results.get('ndci',     np.nan),
+        'clarity'        : forecast_results.get('clarity',  np.nan),
+        'algae'          : forecast_results.get('algae',    np.nan),
+        'sediment'       : forecast_results.get('sediment', np.nan),
+        'area_change_km2': forecast_area - last_area,
+        'area_change_pct': (forecast_area - last_area) / last_area * 100 if last_area > 0 else np.nan,
+    }
+
+    existing_df = pd.read_csv(csv_path, index_col='year')
+    if forecast_year in existing_df.index:
+        existing_df = existing_df.drop(forecast_year)
+
+    forecast_series = pd.Series(forecast_row_data, name=forecast_year)
+    updated_df      = pd.concat([existing_df, forecast_series.to_frame().T])
+    updated_df.index.name = 'year'
+    updated_df.to_csv(csv_path)
+    print(f'  Forecast row ({forecast_year}) appended to {csv_path}')
+
+
+
+def forecast_next_year(summary_df, forecast_year=2026):
+    """
+    Fit a linear trend to each metric in summary_df and extrapolate to forecast_year.
+    Returns a dict with predicted values and 95% prediction intervals.
+    """
+    historical_years = np.array(summary_df.index, dtype=float)
+    forecast_results = {'year': forecast_year}
+
+    target_columns = ['water_area_km2', 'ndti', 'ndci', 'clarity', 'algae', 'sediment']
+
+    for column_name in target_columns:
+        observed_values = summary_df[column_name].values.astype(float)
+        finite_mask     = np.isfinite(observed_values)
+
+        if finite_mask.sum() < 3:
+            forecast_results[column_name]              = np.nan
+            forecast_results[f'{column_name}_ci_low']  = np.nan
+            forecast_results[f'{column_name}_ci_high'] = np.nan
+            continue
+
+        valid_years  = historical_years[finite_mask]
+        valid_values = observed_values[finite_mask]
+        num_samples  = len(valid_years)
+
+        # Fit degree-1 polynomial (linear trend)
+        slope, intercept   = np.polyfit(valid_years, valid_values, 1)
+        predicted_value    = slope * forecast_year + intercept
+        fitted_values      = slope * valid_years + intercept
+        residuals          = valid_values - fitted_values
+        mean_squared_error = np.mean(residuals ** 2)
+
+        # 95% prediction interval using Student's t
+        years_mean = valid_years.mean()
+        se_forecast = np.sqrt(
+            mean_squared_error * (
+                1 + 1 / num_samples
+                + (forecast_year - years_mean) ** 2 / np.sum((valid_years - years_mean) ** 2)
+            )
+        )
+        # t critical value at 95% with (n-2) degrees of freedom
+        t_critical = _t_critical_95(num_samples - 2)
+        margin     = t_critical * se_forecast
+
+        forecast_results[column_name]              = predicted_value
+        forecast_results[f'{column_name}_ci_low']  = predicted_value - margin
+        forecast_results[f'{column_name}_ci_high'] = predicted_value + margin
+
+    return forecast_results
+
+
+def _t_critical_95(degrees_of_freedom):
+    """Approximate two-tailed t critical value at 95% confidence."""
+    # Lookup table for common small sample sizes; falls back to 1.96 for large n
+    t_table = {
+        1: 12.706, 2: 4.303, 3: 3.182, 4: 2.776, 5: 2.571,
+        6: 2.447,  7: 2.365, 8: 2.306, 9: 2.262, 10: 2.228,
+    }
+    return t_table.get(degrees_of_freedom, 1.96)
+
+
+def plot_area_forecast(summary_df, forecast_results):
+    """Extend area time series chart to 2026 forecast with confidence interval."""
+    print('Plotting area forecast...')
+
+    historical_years      = summary_df.index.tolist()
+    historical_areas      = summary_df['water_area_km2'].tolist()
+    forecast_year         = forecast_results['year']
+    forecast_area         = forecast_results['water_area_km2']
+    forecast_area_ci_low  = forecast_results['water_area_km2_ci_low']
+    forecast_area_ci_high = forecast_results['water_area_km2_ci_high']
+
+    fig, ax = plt.subplots(figsize=(14, 7))
+
+    # Historical observed line
+    ax.plot(historical_years, historical_areas, 'o-', color='#0077b6', linewidth=2.5,
+            markersize=8, markerfacecolor='white', markeredgewidth=2, label='Observed')
+    ax.fill_between(historical_years, historical_areas, alpha=0.15, color='#0077b6')
+    for observed_year, observed_area in zip(historical_years, historical_areas):
+        ax.annotate(f'{observed_area:.2f}', (observed_year, observed_area),
+                    textcoords='offset points', xytext=(0, 10), ha='center', fontsize=8)
+
+    # Dashed bridge from last observed to forecast
+    last_observed_year = historical_years[-1]
+    last_observed_area = historical_areas[-1]
+    ax.plot([last_observed_year, forecast_year], [last_observed_area, forecast_area],
+            '--', color='#ef233c', linewidth=2, alpha=0.7)
+
+    # Forecast point
+    ax.plot(forecast_year, forecast_area, 's', color='#ef233c', markersize=11,
+            markeredgewidth=2, markerfacecolor='#ef233c', label=f'{forecast_year} Forecast', zorder=5)
+
+    # 95% confidence band from last observed to forecast
+    ax.fill_between(
+        [last_observed_year, forecast_year],
+        [last_observed_area, forecast_area_ci_low],
+        [last_observed_area, forecast_area_ci_high],
+        alpha=0.2, color='#ef233c', label='95% Prediction Interval',
+    )
+
+    ax.annotate(
+        f'{forecast_area:.2f} km²\n[{forecast_area_ci_low:.2f} – {forecast_area_ci_high:.2f}]',
+        (forecast_year, forecast_area),
+        textcoords='offset points', xytext=(10, 6),
+        fontsize=9, color='#c1121f', fontweight='bold',
+    )
+
+    ax.set_xlabel('Year', fontsize=12)
+    ax.set_ylabel('Water Area (km²)', fontsize=12)
+    ax.set_title('Water Body Area — Historical + Forecast (Linear Trend Extrapolation)',
+                 fontsize=13, fontweight='bold')
+    ax.legend(fontsize=10)
+    ax.set_xticks(historical_years + [forecast_year])
+    ax.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    output_path = os.path.join(RESULTS_DIR, '06_area_forecast.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'  Saved: {output_path}')
+
+
+def plot_quality_forecast(summary_df, forecast_results):
+    """Show historical + forecast for each quality index in a grid."""
+    print('Plotting quality index forecasts...')
+
+    historical_years = summary_df.index.tolist()
+    forecast_year    = forecast_results['year']
+
+    quality_metrics = [
+        ('ndti',     'NDTI (Turbidity)',        '#e07b39'),
+        ('ndci',     'NDCI (Chlorophyll-a)',    '#2dc653'),
+        ('clarity',  'Clarity (B2/B4)',         '#00b4d8'),
+        ('algae',    'Algae Index (B8-B4)',      '#9b5de5'),
+        ('sediment', 'Sediment Proxy (B4)',     '#f77f00'),
+    ]
+
+    fig, axes = plt.subplots(2, 3, figsize=(18, 10))
+    fig.suptitle(f'Water Quality Indices — Historical & {forecast_year} Forecast',
+                 fontsize=14, fontweight='bold')
+
+    for ax, (metric_name, metric_label, metric_color) in zip(axes.flat, quality_metrics):
+        historical_values = summary_df[metric_name].tolist()
+        forecast_value    = forecast_results.get(metric_name, np.nan)
+        ci_low            = forecast_results.get(f'{metric_name}_ci_low', np.nan)
+        ci_high           = forecast_results.get(f'{metric_name}_ci_high', np.nan)
+
+        ax.plot(historical_years, historical_values, 'o-', color=metric_color,
+                linewidth=2, markersize=6, markerfacecolor='white', markeredgewidth=1.5,
+                label='Observed')
+
+        if np.isfinite(forecast_value):
+            last_year  = historical_years[-1]
+            last_value = historical_values[-1]
+            ax.plot([last_year, forecast_year], [last_value, forecast_value],
+                    '--', color=metric_color, linewidth=1.8, alpha=0.7)
+            ax.plot(forecast_year, forecast_value, 's', color=metric_color,
+                    markersize=9, markeredgewidth=2, label=f'{forecast_year} forecast', zorder=5)
+            if np.isfinite(ci_low) and np.isfinite(ci_high):
+                ax.fill_between([last_year, forecast_year],
+                                [last_value, ci_low], [last_value, ci_high],
+                                alpha=0.2, color=metric_color)
+
+        ax.set_title(metric_label, fontsize=10)
+        ax.set_xticks(historical_years + [forecast_year])
+        ax.tick_params(axis='x', rotation=45, labelsize=7)
+        ax.legend(fontsize=8)
+        ax.grid(True, alpha=0.3)
+
+    # Hide the unused 6th subplot
+    axes.flat[-1].set_visible(False)
+
+    plt.tight_layout()
+    output_path = os.path.join(RESULTS_DIR, '07_quality_forecast.png')
+    plt.savefig(output_path, dpi=150, bbox_inches='tight')
+    plt.close()
+    print(f'  Saved: {output_path}')
+
+
 # ── MAIN ──────────────────────────────────────────────────────────────────────
 
 def main():
@@ -583,6 +799,26 @@ def main():
     plot_change_maps(all_masks)
     plot_quality_timeseries(df)
     plot_summary_dashboard(df, all_masks)
+
+    # Step 4: Temporal forecasting (area + quality indices)
+    print('\n── Step 4: Temporal Forecasting ──')
+    forecast_results = forecast_next_year(df, forecast_year=2026)
+    forecast_year    = forecast_results['year']
+
+    print(f'\n  {forecast_year} Forecast (linear trend extrapolation):')
+    area_pred    = forecast_results['water_area_km2']
+    area_ci_low  = forecast_results['water_area_km2_ci_low']
+    area_ci_high = forecast_results['water_area_km2_ci_high']
+    print(f'    Water area : {area_pred:.2f} km²  '
+          f'[95% CI: {area_ci_low:.2f} – {area_ci_high:.2f} km²]')
+    for quality_metric in ['ndti', 'ndci', 'clarity', 'sediment']:
+        predicted_val = forecast_results.get(quality_metric, np.nan)
+        if np.isfinite(predicted_val):
+            print(f'    {quality_metric.upper():10s}: {predicted_val:.4f}')
+
+    plot_area_forecast(df, forecast_results)
+    plot_quality_forecast(df, forecast_results)
+    append_forecast_to_csv(df, forecast_results)
 
     print(f'\nAll outputs saved to: {RESULTS_DIR}')
     print('Done.')
