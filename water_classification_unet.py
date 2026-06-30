@@ -25,7 +25,7 @@ TEST_YEARS      = [2023, 2024, 2025]
 
 BATCH_SIZE          = 8
 LEARNING_RATE       = 1e-4
-NUM_EPOCHS          = 10
+NUM_EPOCHS          = 100
 BATCHES_PER_EPOCH   = 80   # set to None to use all batches
 BATCHES_PER_EVAL    = 40   # set to None to evaluate on full test set
 DEVICE              = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
